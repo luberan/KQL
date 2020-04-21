@@ -1,0 +1,6 @@
+search in (DeviceFileEvents, DeviceProcessEvents, DeviceEvents, DeviceRegistryEvents, DeviceNetworkEvents, DeviceImageLoadEvents, DeviceLogonEvents)
+    ActionType == "AsrUntrustedExecutableBlocked"
+| where Timestamp > ago(180d)
+| summarize count(), makeset(DeviceName), makeset(FileName), makeset(FolderPath), max(Timestamp) by SHA1
+| project-rename SHA1, Count=count_, DeviceName=set_DeviceName, FileName=set_FileName, FolderPath=set_FolderPath, LastTimestamp=max_Timestamp
+| sort by LastTimestamp desc
