@@ -1,0 +1,6 @@
+SecurityEvent
+| where EventID == 4625
+| project TimeGenerated, Account, IpAddress, WorkstationName
+| summarize FailedLogins=count(), makeset(IpAddress), makeset(WorkstationName) by Account
+| project-rename Account, FailedLogins, IpAddress=set_IpAddress, ComputerName=set_WorkstationName
+| top 100 by FailedLogins desc
