@@ -1,0 +1,4 @@
+DeviceEvents
+| where ActionType == 'AntivirusScanCompleted'
+| project DeviceName, Timestamp
+| summarize Time = max(Timestamp) by DeviceName
