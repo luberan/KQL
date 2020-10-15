@@ -1,0 +1,4 @@
+DeviceLogonEvents
+| where ActionType == 'LogonSuccess' and LogonType == 'Interactive' and InitiatingProcessParentFileName == 'wininit.exe' and InitiatingProcessCommandLine == 'lsass.exe'
+| project DeviceName, AccountDomain, AccountName, Timestamp
+| summarize Time = max(Timestamp) by DeviceName, AccountDomain, AccountName
