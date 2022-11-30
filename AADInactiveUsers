@@ -1,0 +1,7 @@
+SigninLogs
+| extend d = parse_json(AuthenticationDetails)
+| extend LoginTimestamp = todatetime(d[0].authenticationStepDateTime)
+| summarize max(LoginTimestamp) by UserPrincipalName
+| where max_LoginTimestamp < ago(30d)
+| distinct UserPrincipalName,max_LoginTimestamp
+| sort by max_LoginTimestamp asc
