@@ -2,6 +2,5 @@ SigninLogs
 | where TimeGenerated >= ago(90d)
 | where Location !in ("CZ")
 | extend d = parse_json(AuthenticationDetails)
-| extend LoginResult = d[0].succeeded
-| where LoginResult == true
+| where d[0].succeeded == true
 | summarize make_set(Location) by UserPrincipalName
