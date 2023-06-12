@@ -1,0 +1,27 @@
+let timeRange = 24h;
+let authenticationWindow = 1h;
+let authenticationThreshold = 5;
+SigninLogs
+| where TimeGenerated > ago(timeRange)
+| where isnotempty(IPAddress) and isnotempty(UserPrincipalName) and AppDisplayName != "Windows Sign In" and AppDisplayName != "Microsoft Authentication Broker"
+| extend Outcome = iff(ResultType in ("0", "50125", "50140"), "Success", "Failure")
+// bin outcomes into 10 minute windows to reduce the volume of data
+| summarize OutcomeCount=count() by bin(TimeGenerated, 10m), UserPrincipalName, IPAddress, AppDisplayName, Outcome
+| project TimeGenerated, UserPrincipalName, IPAddress, AppDisplayName, Outcome, OutcomeCount
+// sort ready for sessionizing - by account and time of the authentication outcome
+| sort by UserPrincipalName asc, TimeGenerated asc
+| serialize
+// sessionize into failure groupings until either the account changes or there is a success
+| extend SessionStartedUtc = row_window_session(TimeGenerated, timeRange, authenticationWindow, UserPrincipalName != prev(UserPrincipalName) or prev(Outcome) == "Success")
+// count the failures in each session
+| summarize FailureCountBeforeSuccess=sumif(OutcomeCount, Outcome == "Failure"), StartTime=min(TimeGenerated), EndTime=max(TimeGenerated), make_list(Outcome, 128), make_set(AppDisplayName, 128), make_set(IPAddress, 128) by SessionStartedUtc, UserPrincipalName
+// the session must not start with a success, and must end with one
+| where array_index_of(list_Outcome, "Success") != 0
+| where array_index_of(list_Outcome, "Success") == array_length(list_Outcome) - 1
+| project-away SessionStartedUtc, list_Outcome
+// where the number of failures before the success is above the threshold
+| where FailureCountBeforeSuccess >= authenticationThreshold
+// expand out ip and computer for customer entity assignment
+| mv-expand set_IPAddress, set_AppDisplayName
+| extend IP = tostring(set_IPAddress), AppName = tostring(set_AppDisplayName)
+| project UserPrincipalName,FailureCountBeforeSuccess,StartTime,EndTime,IP,AppName
