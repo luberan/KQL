@@ -1,0 +1,19 @@
+let known_locations =
+union isfuzzy=True AADNonInteractiveUserSignInLogs, SigninLogs
+| where TimeGenerated between(ago(30d)..ago(1d))
+| where ResultType == 0
+| summarize by Location;
+union isfuzzy=True AADNonInteractiveUserSignInLogs, SigninLogs
+| where TimeGenerated > ago(1d)
+| where ResultType != 50126
+| where Location !in (known_locations)
+| extend LocationDetails_dynamic = column_ifexists("LocationDetails_dynamic", "")
+| extend DeviceDetail_dynamic = column_ifexists("DeviceDetail_dynamic", "")
+| extend LocationDetails = iif(isnotempty(LocationDetails_dynamic), LocationDetails_dynamic, parse_json(LocationDetails_string))
+| extend DeviceDetail = iif(isnotempty(DeviceDetail_dynamic), DeviceDetail_dynamic, parse_json(DeviceDetail_string))
+| extend City = tostring(LocationDetails.city)
+| extend State = tostring(LocationDetails.state)
+| extend Place = strcat(City, " - ", State)
+| extend DeviceId = tostring(DeviceDetail.deviceId)
+| extend Result = strcat(tostring(ResultType), " - ", ResultDescription)
+| summarize FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated), make_set(Result), make_set(IPAddress), make_set(UserAgent), make_set(Place), make_set(DeviceId) by UserPrincipalName, Location, Category
