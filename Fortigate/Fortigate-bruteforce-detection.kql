@@ -1,0 +1,3 @@
+CommonSecurityLog
+| where DeviceVendor == "Fortinet"
+| where DeviceEventClassID == "39426"
