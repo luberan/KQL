@@ -1,0 +1,61 @@
+// This near-real-time (NRT) analytic rule monitors changes to audit policy configuration on Domain Controllers. The detection was expanded to include Event IDs 4715, 4817, and 4912 as well, as these events cover additional security-relevant changes to audit policy configuration, including changes to the audit policy security descriptor, Global Object Access Auditing, and per-user audit policies.
+let DomainControllers =
+    _GetWatchlist("DCSyncAllowedSources")
+    | where Role =~ "DomainController"
+    | where isnotempty(DeviceName)
+    | extend
+        WatchlistDeviceName = tostring(DeviceName),
+        DCName = tolower(tostring(split(tostring(DeviceName), ".")[0]))
+    | summarize WatchlistDeviceName = take_any(WatchlistDeviceName) by DCName;
+SecurityEvent
+| where EventID in (4715, 4719, 4817, 4906, 4912)
+| extend DCName = tolower(tostring(split(Computer, ".")[0]))
+| lookup kind=inner DomainControllers on DCName
+| extend EventDescription = case(
+    EventID == 4715, "Audit policy security descriptor changed",
+    EventID == 4719, "System audit policy changed",
+    EventID == 4817, "Global Object Access Auditing policy changed",
+    EventID == 4906, "CrashOnAuditFail value changed",
+    EventID == 4912, "Per-user audit policy changed",
+    "Audit policy changed"
+)
+| extend InitiatingAccount = case(
+    isnotempty(SubjectDomainName) and isnotempty(SubjectUserName),
+        strcat(SubjectDomainName, "\\", SubjectUserName),
+    SubjectUserName
+)
+| extend AuditPolicyChangeReadable =
+    replace_string(
+        replace_string(
+            replace_string(
+                replace_string(
+                    AuditPolicyChanges,
+                    "%%8448", "Success removed"),
+                "%%8449", "Success added"),
+            "%%8450", "Failure removed"),
+        "%%8451", "Failure added")
+| extend
+    HostName = tostring(split(Computer, ".")[0]),
+    HostDomain = substring(
+        Computer,
+        indexof(Computer, ".") + 1
+    )
+| project
+    TimeGenerated,
+    Computer,
+    WatchlistDeviceName,
+    EventID,
+    EventDescription,
+    InitiatingAccount,
+    SubjectUserName,
+    SubjectDomainName,
+    SubjectUserSid,
+    SubjectLogonId,
+    AuditPolicyChangeReadable,
+    SubcategoryGuid,
+    ObjectType,
+    ObjectName,
+    EventData,
+    EventRecordId,
+    HostName,
+    HostDomain
