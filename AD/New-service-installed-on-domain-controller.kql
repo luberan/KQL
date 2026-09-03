@@ -1,0 +1,164 @@
+// This NRT analytic rule monitors service-related changes on domain controllers identified through the existing DCSyncAllowedSources watchlist (Role = DomainController). It detects new service installations using both System Event ID 7045 and Security Event ID 4697, as well as service startup type changes using Event ID 7040. Event ID 4697 was added because it provides better attribution, including the account that performed the service installation.
+let DomainControllers =
+    _GetWatchlist("DCSyncAllowedSources")
+    | where Role =~ "DomainController"
+    | where isnotempty(DeviceName)
+    | extend
+        WatchlistDeviceName = tostring(DeviceName),
+        DCName = tolower(tostring(split(tostring(DeviceName), ".")[0]))
+    | summarize WatchlistDeviceName = take_any(WatchlistDeviceName) by DCName;
+let PerUserServices = dynamic([
+    "AarSvc",
+    "BcastDVRUserService",
+    "BluetoothUserService",
+    "CaptureService",
+    "cbdhsvc",
+    "CloudBackupRestoreSvc",
+    "CDPUserSvc",
+    "ConsentUxUserSvc",
+    "CredentialEnrollmentManagerUserSvc",
+    "DeviceAssociationBrokerSvc",
+    "DevicePickerUserSvc",
+    "DevicesFlowUserSvc",
+    "MessagingService",
+    "NPSMSvc",
+    "OneSyncSvc",
+    "P9RdrService",
+    "PenService",
+    "PimIndexMaintenanceSvc",
+    "PrintWorkflowUserSvc",
+    "UdkUserSvc",
+    "UnistoreSvc",
+    "UserDataSvc",
+    "webthreatdefusersvc",
+    "WpnUserService"
+]);
+let SystemEvents =
+    Event
+    | where EventLog =~ "System"
+    | where Source =~ "Service Control Manager"
+    | where EventID in (7045, 7040)
+    | extend DCName = tolower(tostring(split(Computer, ".")[0]))
+    | join kind=inner DomainControllers on DCName
+    | extend
+        EventAction = case(
+            EventID == 7045, "Service installed",
+            EventID == 7040, "Service start type changed",
+            "Unknown"
+        ),
+        ServiceName = case(
+            EventID == 7045,
+                extract('<Data Name="ServiceName">([^<]*)</Data>', 1, EventData),
+            EventID == 7040,
+                extract('<Data Name="param4">([^<]*)</Data>', 1, EventData),
+            ""
+        ),
+        ServiceDisplayName = iff(
+            EventID == 7040,
+            extract('<Data Name="param1">([^<]*)</Data>', 1, EventData),
+            ""
+        ),
+        ServiceFileName = iff(
+            EventID == 7045,
+            extract('<Data Name="ImagePath">([^<]*)</Data>', 1, EventData),
+            ""
+        ),
+        ServiceType = iff(
+            EventID == 7045,
+            extract('<Data Name="ServiceType">([^<]*)</Data>', 1, EventData),
+            ""
+        ),
+        ServiceStartType = iff(
+            EventID == 7045,
+            extract('<Data Name="StartType">([^<]*)</Data>', 1, EventData),
+            ""
+        ),
+        PreviousStartType = iff(
+            EventID == 7040,
+            extract('<Data Name="param2">([^<]*)</Data>', 1, EventData),
+            ""
+        ),
+        NewStartType = iff(
+            EventID == 7040,
+            extract('<Data Name="param3">([^<]*)</Data>', 1, EventData),
+            ""
+        ),
+        ServiceAccount = iff(
+            EventID == 7045,
+            extract('<Data Name="AccountName">([^<]*)</Data>', 1, EventData),
+            ""
+        )
+    | extend ServiceBaseName =
+        extract(@"^(.+?)_[0-9a-fA-F]+$", 1, ServiceName)
+    | extend ServiceBaseName =
+        iff(isempty(ServiceBaseName), ServiceName, ServiceBaseName)
+    | where not(
+        EventID == 7045
+        and ServiceBaseName in~ (PerUserServices)
+        and ServiceName matches regex @"_[0-9a-fA-F]+$"
+    )
+    | extend
+        SubjectUserName = "",
+        SubjectDomainName = "",
+        SubjectUserSid = "",
+        SubjectLogonId = "",
+        EventSource = "System"
+    | extend
+        HostName = tostring(split(Computer, ".")[0]),
+        HostDnsDomain = extract(@"^[^.]+\.(.+)$", 1, Computer)
+    | project
+        TimeGenerated,
+        Computer,
+        EventID,
+        EventAction,
+        ServiceName,
+        ServiceFileName,
+        ServiceType,
+        ServiceStartType,
+        PreviousStartType,
+        NewStartType,
+        ServiceAccount,
+        SubjectUserName,
+        SubjectDomainName,
+        SubjectUserSid,
+        SubjectLogonId,
+        EventSource,
+        WatchlistDeviceName,
+        HostName,
+        HostDnsDomain;
+let SecurityEvents =
+    SecurityEvent
+    | where EventID == 4697
+    | extend DCName = tolower(tostring(split(Computer, ".")[0]))
+    | join kind=inner DomainControllers on DCName
+    | where tostring(ServiceType) !in~ ("0xd0", "0xe0")
+    | extend
+        EventAction = "Service installed",
+        PreviousStartType = "",
+        NewStartType = "",
+        EventSource = "Security"
+    | extend
+        HostName = tostring(split(Computer, ".")[0]),
+        HostDnsDomain = extract(@"^[^.]+\.(.+)$", 1, Computer)
+    | project
+        TimeGenerated,
+        Computer,
+        EventID,
+        EventAction,
+        ServiceName = tostring(ServiceName),
+        ServiceFileName = tostring(ServiceFileName),
+        ServiceType = tostring(ServiceType),
+        ServiceStartType = tostring(ServiceStartType),
+        PreviousStartType,
+        NewStartType,
+        ServiceAccount = tostring(ServiceAccount),
+        SubjectUserName = tostring(SubjectUserName),
+        SubjectDomainName = tostring(SubjectDomainName),
+        SubjectUserSid = tostring(SubjectUserSid),
+        SubjectLogonId = tostring(SubjectLogonId),
+        EventSource,
+        WatchlistDeviceName,
+        HostName,
+        HostDnsDomain;
+union SystemEvents, SecurityEvents
+| order by TimeGenerated desc
