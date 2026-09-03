@@ -1,0 +1,198 @@
+// This detection combines Microsoft Defender for Identity (MDI) native detections with a custom Microsoft Sentinel KQL analytics rule.
+// MDI is used for reconnaissance techniques that Microsoft already detects natively, such as suspicious LDAP queries targeting sensitive attributes, SPN enumeration, Kerberoasting-related reconnaissance, and query patterns associated with known attack tools. Reimplementing these detections in KQL would duplicate existing MDI analytics and would generally provide less reliable results than the built-in behavioral detections.
+// The custom KQL rule therefore focuses on the part that is specific to anomalous LDAP enumeration volume and query shape compared with the normal baseline for each account and source host. It uses IdentityQueryEvents telemetry from MDI and identifies unusual increases in LDAP query volume, target diversity, or query diversity, including activity involving attributes commonly associated with Active Directory reconnaissance.
+// This approach provides broader coverage while avoiding unnecessary duplication: MDI handles known reconnaissance patterns, while Sentinel adds environment-specific behavioral anomaly detection and enables custom incident handling, enrichment, and automation.
+let BaselineWindow = 14d;
+let CurrentWindow = 1h;
+let MinVolume = 200;
+let HighVolumeFloor = 1000;
+let VolumeMultiplier = 3.0;
+let MinDistinctTargets = 10;
+let TargetMultiplier = 2.0;
+let MinDistinctQueries = 8;
+let QueryMultiplier = 2.0;
+let MinBaselineHours = 5;
+let LDAPData =
+    IdentityQueryEvents
+    | where TimeGenerated >= ago(BaselineWindow)
+    | where ActionType == "LDAP query"
+    | extend AF = todynamic(AdditionalFields)
+    | extend RawCount = tolong(AF["Count"])
+    | extend QueryCount = iff(isnull(RawCount) or RawCount < 1, tolong(1), RawCount)
+    | extend QueryText = tolower(
+        strcat(
+            Query,
+            " ",
+            tostring(AF["SearchFilter"]),
+            " ",
+            tostring(AF["BaseObject"])
+        )
+    )
+    | extend SensitiveShape =
+        QueryText has_any (
+            "serviceprincipalname",
+            "pwdlastset",
+            "ntsecuritydescriptor",
+            "msds-allowedtodelegateto",
+            "admincount",
+            "1.2.840.113556.1.4.1941",
+            "1.2.840.113556.1.4.803"
+        )
+        or tolower(QueryTarget) has_any (
+            "domain admins",
+            "enterprise admins",
+            "schema admins"
+        )
+    | extend AccountKey =
+        iff(
+            isnotempty(AccountSid),
+            AccountSid,
+            iff(
+                isnotempty(AccountUpn),
+                AccountUpn,
+                strcat(AccountDomain, "\\", AccountName)
+            )
+        )
+    | extend SourceHost = tostring(DeviceName)
+    | extend SourceIP = tostring(IPAddress)
+    | extend SourceKey = iff(isnotempty(SourceHost), SourceHost, SourceIP)
+    | where isnotempty(AccountKey)
+    | where isnotempty(SourceKey);
+let HistoricalBins =
+    LDAPData
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(CurrentWindow))
+    | summarize
+        HourVolume = sum(QueryCount),
+        HourDistinctTargets = dcount(QueryTarget),
+        HourDistinctQueries = dcount(Query)
+        by AccountKey, SourceKey, bin(TimeGenerated, 1h);
+let Baseline =
+    HistoricalBins
+    | summarize
+        BaselineHours = count(),
+        AvgVolume = avg(todouble(HourVolume)),
+        P95Volume = percentile(HourVolume, 95),
+        P95DistinctTargets = percentile(HourDistinctTargets, 95),
+        P95DistinctQueries = percentile(HourDistinctQueries, 95)
+        by AccountKey, SourceKey;
+let Current =
+    LDAPData
+    | where TimeGenerated > ago(CurrentWindow)
+    | summarize
+        CurrentVolume = sum(QueryCount),
+        CurrentEvents = count(),
+        DistinctQueryTypes = dcount(QueryType),
+        DistinctTargets = dcount(QueryTarget),
+        DistinctQueries = dcount(Query),
+        SensitiveShapeEvents = countif(SensitiveShape),
+        QueryTypes = make_set(QueryType, 20),
+        QueryTargets = make_set(QueryTarget, 20),
+        SampleQueries = make_set(QueryText, 5),
+        DestinationDCs = make_set(DestinationDeviceName, 10),
+        StartTime = min(TimeGenerated),
+        EndTime = max(TimeGenerated)
+        by
+            AccountKey,
+            AccountSid,
+            AccountUpn,
+            AccountName,
+            AccountDomain,
+            SourceKey,
+            SourceHost,
+            SourceIP;
+Current
+| join kind=leftouter Baseline on AccountKey, SourceKey
+| extend BaselineHours = coalesce(BaselineHours, tolong(0))
+| extend IsNewAccountHostPair = BaselineHours < MinBaselineHours
+| extend VolumeThreshold =
+    max_of(
+        todouble(MinVolume),
+        coalesce(todouble(P95Volume), 0.0) * VolumeMultiplier
+    )
+| extend TargetThreshold =
+    max_of(
+        todouble(MinDistinctTargets),
+        coalesce(todouble(P95DistinctTargets), 0.0) * TargetMultiplier
+    )
+| extend QueryThreshold =
+    max_of(
+        todouble(MinDistinctQueries),
+        coalesce(todouble(P95DistinctQueries), 0.0) * QueryMultiplier
+    )
+| extend VolumeAnomaly =
+    CurrentVolume >= MinVolume
+    and (
+        IsNewAccountHostPair
+        or todouble(CurrentVolume) > VolumeThreshold
+    )
+| extend TargetShapeAnomaly =
+    DistinctTargets >= MinDistinctTargets
+    and (
+        IsNewAccountHostPair
+        or todouble(DistinctTargets) > TargetThreshold
+    )
+| extend QueryShapeAnomaly =
+    DistinctQueries >= MinDistinctQueries
+    and (
+        IsNewAccountHostPair
+        or todouble(DistinctQueries) > QueryThreshold
+    )
+| extend StrongVolumeAnomaly =
+    CurrentVolume >= HighVolumeFloor
+    and (
+        IsNewAccountHostPair
+        or todouble(CurrentVolume) >
+            max_of(
+                todouble(HighVolumeFloor),
+                coalesce(todouble(P95Volume), 0.0) * 5.0
+            )
+    )
+| where
+    StrongVolumeAnomaly
+    or (
+        VolumeAnomaly
+        and (
+            TargetShapeAnomaly
+            or QueryShapeAnomaly
+            or SensitiveShapeEvents > 0
+        )
+    )
+| extend AccountDisplay =
+    iff(
+        isnotempty(AccountUpn),
+        AccountUpn,
+        strcat(AccountDomain, "\\", AccountName)
+    )
+| extend SourceDisplay =
+    iff(isnotempty(SourceHost), SourceHost, SourceIP)
+| extend
+    SourceHostName = tostring(split(SourceHost, ".")[0]),
+    SourceDnsDomain = strcat_array(array_slice(split(SourceHost, "."), 1, -1), ".")
+| project
+    TimeGenerated = EndTime,
+    StartTime,
+    EndTime,
+    AccountDisplay,
+    AccountSid,
+    AccountUpn,
+    AccountName,
+    AccountDomain,
+    SourceDisplay,
+    SourceHost,
+    SourceIP,
+    CurrentVolume,
+    AvgVolume,
+    P95Volume,
+    VolumeThreshold,
+    DistinctTargets,
+    P95DistinctTargets,
+    DistinctQueries,
+    P95DistinctQueries,
+    SensitiveShapeEvents,
+    IsNewAccountHostPair,
+    QueryTypes,
+    QueryTargets,
+    SampleQueries,
+    DestinationDCs,
+    SourceHostName,
+    SourceDnsDomain
