@@ -1,0 +1,45 @@
+// This is a near-real-time (NRT) analytic rule that detects Active Directory directory service replication activity originating from unauthorized sources that are neither approved domain controllers nor Microsoft Entra Connect servers. The list of authorized replication sources is maintained in a Microsoft Sentinel watchlist named DCSyncAllowedSources, which contains the IP addresses and host names of systems that are allowed to initiate directory replication.
+// The rule uses IdentityDirectoryEvents telemetry provided by Microsoft Defender for Identity (MDI), specifically directory replication activity over the DRSR protocol. All domain controllers are monitored by MDI, so the relevant directory replication telemetry is available in Sentinel.
+// DCSync can also be detected using Windows Security events, primarily Event ID 4662 correlated with Event ID 4624. However, this approach relies on Windows auditing and logon-event correlation to identify the source of the replication request. MDI provides more direct visibility into the replication source and destination, which makes it better suited for this detection scenario.
+let AllowedSources =
+    _GetWatchlist("DCSyncAllowedSources")
+    | project AllowedIP = tostring(SearchKey);
+IdentityDirectoryEvents
+| where ActionType == "Directory Services replication"
+| where Protocol =~ "Drsr"
+| extend AF = todynamic(AdditionalFields)
+| extend
+    SourceIP = tostring(IPAddress),
+    ActorDevice = AF["ACTOR.DEVICE"],
+    ActivityCount = toint(AF["Count"]),
+    AttackTechniques = tostring(AF["AttackTechniques"])
+| extend
+    SourceHostName = case(
+        isnotempty(DeviceName), tostring(split(DeviceName, ".")[0]),
+        array_length(ActorDevice) > 0, tostring(ActorDevice[0]),
+        tostring(ActorDevice)
+    )
+| join kind=leftanti AllowedSources on $left.SourceIP == $right.AllowedIP
+| extend
+    DestinationHostName = tostring(split(DestinationDeviceName, ".")[0]),
+    DestinationDnsDomain = iff(
+        DestinationDeviceName contains ".",
+        substring(
+            DestinationDeviceName,
+            strlen(tostring(split(DestinationDeviceName, ".")[0])) + 1
+        ),
+        ""
+    )
+| project
+    TimeGenerated,
+    SourceIP,
+    SourceHostName,
+    DestinationHostName,
+    DestinationDnsDomain,
+    DestinationIPAddress,
+    AccountName,
+    AccountDomain,
+    AccountSid,
+    ActivityCount,
+    Protocol,
+    AttackTechniques
