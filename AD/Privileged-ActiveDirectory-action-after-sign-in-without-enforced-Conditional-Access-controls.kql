@@ -1,0 +1,244 @@
+// This scheduled analytic rule detects successful Entra ID sign-ins where Conditional Access controls were not effectively enforced and correlates them with subsequent privileged actions performed by the same hybrid identity in on-premises Active Directory.
+// The Entra identity is correlated with its on-premises account using identity mapping between the Entra object ID and the Active Directory SID, rather than relying only on usernames or UPNs. The rule focuses on high-impact AD operations, such as adding accounts to Tier-0 privileged groups, and can be extended with other well-defined privileged actions where required.
+let CorrelationWindow = 1h;
+let ActionLookback = 15m;
+let SignInLookback = CorrelationWindow + ActionLookback;
+// -----------------------------------------------------------------------------
+// Successful Entra sign-ins where expected Conditional Access controls
+// were not effectively enforced.
+// -----------------------------------------------------------------------------
+let SuspiciousSignins =
+    union isfuzzy=true
+    (
+        SigninLogs
+        | where TimeGenerated >= ago(SignInLookback)
+        | where tostring(ResultType) == "0"
+        | project
+            SignInTime = TimeGenerated,
+            UserId = tolower(tostring(UserId)),
+            UserPrincipalName = tolower(tostring(UserPrincipalName)),
+            SignInIPAddress = tostring(IPAddress),
+            AppDisplayName = tostring(AppDisplayName),
+            ClientAppUsed = tostring(ClientAppUsed),
+            AuthenticationProtocol = tostring(AuthenticationProtocol),
+            AuthenticationRequirement = tostring(AuthenticationRequirement),
+            ConditionalAccessStatus = tostring(ConditionalAccessStatus),
+            CAPolicies = tostring(ConditionalAccessPolicies),
+            SignInType = "Interactive"
+    ),
+    (
+        AADNonInteractiveUserSignInLogs
+        | where TimeGenerated >= ago(SignInLookback)
+        | where tostring(ResultType) == "0"
+        | project
+            SignInTime = TimeGenerated,
+            UserId = tolower(tostring(UserId)),
+            UserPrincipalName = tolower(tostring(UserPrincipalName)),
+            SignInIPAddress = tostring(IPAddress),
+            AppDisplayName = tostring(AppDisplayName),
+            ClientAppUsed = tostring(ClientAppUsed),
+            AuthenticationProtocol = tostring(AuthenticationProtocol),
+            AuthenticationRequirement = tostring(AuthenticationRequirement),
+            ConditionalAccessStatus = tostring(ConditionalAccessStatus),
+            CAPolicies = tostring(ConditionalAccessPolicies),
+            SignInType = "NonInteractive"
+    )
+    | extend
+        ReportOnlyGap =
+            CAPolicies contains "reportOnlyFailure"
+            or CAPolicies contains "reportOnlyInterrupted",
+        NoCAApplied =
+            ConditionalAccessStatus =~ "notApplied",
+        LegacyAuthentication =
+            ClientAppUsed in~ (
+                "Exchange ActiveSync",
+                "IMAP",
+                "MAPI",
+                "SMTP",
+                "POP",
+                "Other clients"
+            )
+            or AuthenticationProtocol =~ "ropc"
+    | where ReportOnlyGap or NoCAApplied
+    | extend CAGapReason = case(
+        ReportOnlyGap,
+            "Report-only Conditional Access policy was not satisfied",
+        NoCAApplied and LegacyAuthentication,
+            "Legacy authentication / ROPC with no enforced Conditional Access policy",
+        NoCAApplied,
+            "No Conditional Access policy applied",
+        "Other"
+    );
+// -----------------------------------------------------------------------------
+// Map Entra object ID to the on-premises AD SID.
+// This intentionally avoids username/UPN-only correlation.
+// -----------------------------------------------------------------------------
+let IdentityMap =
+    IdentityInfo
+    | where TimeGenerated >= ago(14d)
+    | where isnotempty(AccountObjectId)
+    | where isnotempty(AccountSID)
+    | summarize arg_max(TimeGenerated, *) by AccountObjectId
+    | project
+        MappedUserId = tolower(tostring(AccountObjectId)),
+        ActorSid = tostring(AccountSID),
+        IdentityUPN = tolower(tostring(AccountUPN)),
+        SAMAccountName = tostring(SAMAccountName);
+let HybridSuspiciousSignins =
+    SuspiciousSignins
+    | join kind=inner IdentityMap
+        on $left.UserId == $right.MappedUserId
+    | project
+        SignInTime,
+        UserId,
+        UserPrincipalName,
+        ActorSid,
+        IdentityUPN,
+        SAMAccountName,
+        SignInIPAddress,
+        AppDisplayName,
+        ClientAppUsed,
+        AuthenticationProtocol,
+        AuthenticationRequirement,
+        ConditionalAccessStatus,
+        CAPolicies,
+        SignInType,
+        CAGapReason;
+// -----------------------------------------------------------------------------
+// High-impact AD group membership changes.
+// 4728 = member added to global security group
+// 4756 = member added to universal security group
+//
+// Built-in privileged groups:
+//   Domain Admins     RID 512 - global
+//   Schema Admins     RID 518 - universal
+//   Enterprise Admins RID 519 - universal
+// -----------------------------------------------------------------------------
+let PrivilegedGroupActions =
+    SecurityEvent
+    | where TimeGenerated >= ago(ActionLookback)
+    | where EventID in (4728, 4756)
+    | where TargetSid endswith "-512"
+        or TargetSid endswith "-518"
+        or TargetSid endswith "-519"
+    | extend PrivilegedGroup = case(
+        TargetSid endswith "-512", "Domain Admins",
+        TargetSid endswith "-518", "Schema Admins",
+        TargetSid endswith "-519", "Enterprise Admins",
+        "Unknown privileged group"
+    )
+    | extend
+        ADAction = strcat("Added member to ", PrivilegedGroup),
+        ActorAccount = iff(
+            isnotempty(SubjectDomainName),
+            strcat(SubjectDomainName, "\\", SubjectUserName),
+            SubjectUserName
+        )
+    | project
+        ActionTime = TimeGenerated,
+        ADActionId = strcat(
+            tostring(Computer), ":",
+            tostring(EventRecordId), ":",
+            tostring(EventID)
+        ),
+        ADActionType = "Privileged group membership change",
+        ADAction,
+        EventID,
+        ActorSid = tostring(SubjectUserSid),
+        ActorAccount,
+        TargetName = PrivilegedGroup,
+        TargetSid = tostring(TargetSid),
+        AffectedMemberName = tostring(MemberName),
+        AffectedMemberSid = tostring(MemberSid),
+        DeviceName = tostring(Computer),
+        SourceDeviceName = "",
+        ActionSourceIP = tostring(IpAddress),
+        ActionLogonId = tostring(SubjectLogonId);
+// -----------------------------------------------------------------------------
+// Directory replication / DCSync from Microsoft Defender for Identity.
+// Used instead of generic Security Event 4662.
+// -----------------------------------------------------------------------------
+let DCSyncActions =
+    IdentityDirectoryEvents
+    | where Timestamp >= ago(ActionLookback)
+    | where ActionType == "Directory Services replication"
+    | where Protocol =~ "Drsr"
+    | where isnotempty(AccountSid)
+    | extend
+        ActorAccount = iff(
+            isnotempty(AccountDomain),
+            strcat(AccountDomain, "\\", AccountName),
+            AccountName
+        ),
+        ReplicationTarget = case(
+            isnotempty(TargetAccountUpn), tostring(TargetAccountUpn),
+            isnotempty(TargetDeviceName), tostring(TargetDeviceName),
+            tostring(DestinationDeviceName)
+        )
+    | project
+        ActionTime = Timestamp,
+        ADActionId = strcat(
+            tostring(DeviceName), ":",
+            tostring(ReportId)
+        ),
+        ADActionType = "Directory replication",
+        ADAction = "Directory Services replication (DCSync)",
+        EventID = int(null),
+        ActorSid = tostring(AccountSid),
+        ActorAccount,
+        TargetName = ReplicationTarget,
+        TargetSid = "",
+        AffectedMemberName = "",
+        AffectedMemberSid = "",
+        DeviceName = tostring(DestinationDeviceName),
+        SourceDeviceName = tostring(DeviceName),
+        ActionSourceIP = tostring(IPAddress),
+        ActionLogonId = "";
+// -----------------------------------------------------------------------------
+// Correlate privileged AD activity with the most recent preceding CA-gap sign-in.
+// -----------------------------------------------------------------------------
+let PrivilegedADActions =
+    union isfuzzy=true
+        PrivilegedGroupActions,
+        DCSyncActions;
+PrivilegedADActions
+| join kind=inner HybridSuspiciousSignins on ActorSid
+| where SignInTime <= ActionTime
+    and ActionTime <= SignInTime + CorrelationWindow
+| summarize arg_max(SignInTime, *) by ADActionId
+| extend
+    MinutesAfterSignIn =
+        datetime_diff("minute", ActionTime, SignInTime),
+    SameIPAddress =
+        isnotempty(ActionSourceIP)
+        and ActionSourceIP == SignInIPAddress
+| project
+    ActionTime,
+    SignInTime,
+    MinutesAfterSignIn,
+    UserId,
+    UserPrincipalName,
+    ActorSid,
+    ActorAccount,
+    CAGapReason,
+    ConditionalAccessStatus,
+    AuthenticationRequirement,
+    ClientAppUsed,
+    AuthenticationProtocol,
+    SignInType,
+    SignInIPAddress,
+    AppDisplayName,
+    ADAction,
+    ADActionType,
+    EventID,
+    TargetName,
+    TargetSid,
+    AffectedMemberName,
+    AffectedMemberSid,
+    DeviceName,
+    SourceDeviceName,
+    ActionSourceIP,
+    SameIPAddress,
+    ActionLogonId,
+    CAPolicies
+| order by ActionTime desc
