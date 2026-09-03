@@ -1,0 +1,128 @@
+// This scheduled analytic rule detects successful Entra ID sign-ins where Conditional Access controls were not effectively enforced and correlates them with subsequent privileged actions in Entra ID, such as privileged role assignments or changes to Conditional Access policies.
+// The detection does not treat every ConditionalAccessStatus = notApplied event as a security incident, because this can also occur due to legitimate exclusions or policy scope. Instead, the rule focuses on cases where the lack of enforced Conditional Access is followed by a high-impact administrative action, which provides a much stronger indication that the policy gap may have been used.
+let SignInLookback = 1h;
+let ActionLookback = 15m;
+let SuspiciousSignins =
+    union isfuzzy=true
+    (
+        SigninLogs
+        | where TimeGenerated >= ago(SignInLookback)
+        | where tostring(ResultType) == "0"
+        | project
+            SignInTime = TimeGenerated,
+            UserId = tostring(UserId),
+            UserPrincipalName = tolower(tostring(UserPrincipalName)),
+            SignInIPAddress = tostring(IPAddress),
+            AppDisplayName = tostring(AppDisplayName),
+            ClientAppUsed = tostring(ClientAppUsed),
+            AuthenticationProtocol = tostring(AuthenticationProtocol),
+            AuthenticationRequirement = tostring(AuthenticationRequirement),
+            ConditionalAccessStatus = tostring(ConditionalAccessStatus),
+            CAPolicies = tostring(ConditionalAccessPolicies),
+            SignInType = "Interactive"
+    ),
+    (
+        AADNonInteractiveUserSignInLogs
+        | where TimeGenerated >= ago(SignInLookback)
+        | where tostring(ResultType) == "0"
+        | project
+            SignInTime = TimeGenerated,
+            UserId = tostring(UserId),
+            UserPrincipalName = tolower(tostring(UserPrincipalName)),
+            SignInIPAddress = tostring(IPAddress),
+            AppDisplayName = tostring(AppDisplayName),
+            ClientAppUsed = tostring(ClientAppUsed),
+            AuthenticationProtocol = tostring(AuthenticationProtocol),
+            AuthenticationRequirement = tostring(AuthenticationRequirement),
+            ConditionalAccessStatus = tostring(ConditionalAccessStatus),
+            CAPolicies = tostring(ConditionalAccessPolicies),
+            SignInType = "NonInteractive"
+    )
+    | extend
+        ReportOnlyGap =
+            CAPolicies contains "reportOnlyFailure"
+            or CAPolicies contains "reportOnlyInterrupted",
+        NoCAApplied = ConditionalAccessStatus =~ "notApplied",
+        LegacyAuthentication =
+            ClientAppUsed in~ (
+                "Exchange ActiveSync",
+                "IMAP",
+                "MAPI",
+                "SMTP",
+                "POP",
+                "Other clients"
+            )
+            or AuthenticationProtocol =~ "ropc"
+    | where ReportOnlyGap or NoCAApplied
+    | extend CAGapReason = case(
+        ReportOnlyGap,
+            "Report-only Conditional Access policy was not satisfied",
+        NoCAApplied and LegacyAuthentication,
+            "Legacy authentication / ROPC with no enforced Conditional Access policy",
+        NoCAApplied,
+            "No Conditional Access policy applied",
+        "Other"
+    );
+let PrivilegedEntraActions =
+    AuditLogs
+    | where TimeGenerated >= ago(ActionLookback)
+    | where Result =~ "success"
+    | extend
+        ActionActorId = tostring(InitiatedBy.user.id),
+        ActionActorUPN = tolower(tostring(InitiatedBy.user.userPrincipalName)),
+        ActionIPAddress = tostring(InitiatedBy.user.ipAddress),
+        ActionName = tostring(ActivityDisplayName)
+    | where isnotempty(ActionActorId)
+    | where
+        (
+            Category =~ "RoleManagement"
+            and (
+                ActionName startswith "Add member to role"
+                or ActionName startswith "Add eligible member to role"
+            )
+        )
+        or OperationName in~ (
+            "Add conditional access policy",
+            "Update conditional access policy",
+            "Delete conditional access policy"
+        )
+    | project
+        ActionTime = TimeGenerated,
+        ActionId = tostring(Id),
+        ActionName,
+        OperationName,
+        ActionActorId,
+        ActionActorUPN,
+        ActionIPAddress,
+        TargetResources,
+        LoggedByService;
+PrivilegedEntraActions
+| join kind=inner SuspiciousSignins on $left.ActionActorId == $right.UserId
+| where SignInTime <= ActionTime
+    and ActionTime <= SignInTime + SignInLookback
+| summarize arg_max(SignInTime, *) by ActionId
+| extend
+    MinutesAfterSignIn = datetime_diff("minute", ActionTime, SignInTime),
+    SameIPAddress =
+        isnotempty(ActionIPAddress)
+        and ActionIPAddress == SignInIPAddress
+| project
+    ActionTime,
+    SignInTime,
+    MinutesAfterSignIn,
+    UserId,
+    UserPrincipalName,
+    CAGapReason,
+    ConditionalAccessStatus,
+    AuthenticationRequirement,
+    ClientAppUsed,
+    AuthenticationProtocol,
+    SignInType,
+    SignInIPAddress,
+    ActionIPAddress,
+    SameIPAddress,
+    AppDisplayName,
+    ActionName,
+    OperationName,
+    TargetResources,
+    CAPolicies
