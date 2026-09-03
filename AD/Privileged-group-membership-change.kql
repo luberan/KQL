@@ -1,0 +1,36 @@
+// This is a near-real-time (NRT) analytic rule that detects membership additions to the Domain Admins, Schema Admins, and Enterprise Admins groups based on Security Event IDs 4728 and 4756. Event ID 4732, which was mentioned in the requirements, is not applicable to these groups, as it is generated when a member is added to a security-enabled domain-local group. None of these three privileged groups is domain-local in a standard modern AD environment.
+// In a modern/native-mode Active Directory environment:
+// Domain Admins – Global security group → Event ID 4728 
+// Schema Admins – Universal security group → Event ID 4756 
+// Enterprise Admins – Universal security group → Event ID 4756 
+// All three groups have well-known RIDs (512, 518, and 519), which the rule uses for detection instead of relying on group names. This makes the detection independent of group renaming or localization.
+SecurityEvent
+| where EventID in (4728, 4756)
+| where TargetSid endswith "-512"
+    or TargetSid endswith "-518"
+    or TargetSid endswith "-519"
+| extend PrivilegedGroup = case(
+    TargetSid endswith "-512", "Domain Admins",
+    TargetSid endswith "-518", "Schema Admins",
+    TargetSid endswith "-519", "Enterprise Admins",
+    "Unknown"
+)
+| project
+    TimeGenerated,
+    Computer,
+    EventID,
+    Group = TargetUserName,
+    GroupSid = TargetSid,
+    AddedMember = MemberName,
+    AddedMemberSid = MemberSid,
+    AddedBy = SubjectAccount,
+    AddedByUserName = SubjectUserName,
+    AddedBySid = SubjectUserSid,
+    AddedByDomain = SubjectDomainName,
+    HostName = tostring(split(Computer, ".")[0]),
+    HostDnsDomain = iff(
+        Computer contains ".",
+        substring(Computer, strlen(tostring(split(Computer, ".")[0])) + 1),
+        ""
+    ),
+    PrivilegedGroup
