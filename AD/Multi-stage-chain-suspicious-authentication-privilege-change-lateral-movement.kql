@@ -1,0 +1,219 @@
+// This detection should be implemented as a Microsoft Defender XDR Custom Detection in the unified Defender portal rather than as a traditional Microsoft Sentinel analytics rule. The detection engine therefore runs in Defender XDR, while the query correlates data from both the connected Sentinel workspace and Defender XDR telemetry.
+// The rule detects a high-confidence multi-stage attack chain consisting of:
+// - Suspicious authentication – based on Microsoft Sentinel UEBA BehaviorAnalytics, using successful sign-ins with a high InvestigationPriority. This is preferred over building custom "unusual sign-in" heuristics directly from SigninLogs, because UEBA evaluates the activity against the user's historical behavior and organizational baseline. 
+// - Privilege escalation – based on Windows Security events 4728, 4732, and 4756, limited to highly privileged AD groups such as Domain Admins, Enterprise Admins, Schema Admins, and Administrators. Both the account performing the change and the account receiving the privilege are considered when correlating the attack chain. 
+// - Lateral movement – based on Defender for Endpoint DeviceLogonEvents, focusing on successful remote interactive logons and administrative network logons to other devices. 
+let AuthToPrivilegeWindow = 60m;
+let PrivilegeToLateralWindow = 60m;
+let MinAuthPriority = 5;
+// ============================================================================
+// STAGE 1 - Suspicious successful authentication
+//
+// BehaviorAnalytics provides UEBA event-level behavioral scoring.
+// In this environment:
+//   ~110k successful sign-ins / 30d
+//   only 52 successful sign-ins with InvestigationPriority >= 5
+//
+// Failed sign-ins are deliberately excluded - they are useful for password
+// spray / brute-force detections, but are not evidence that an attacker
+// obtained an authenticated session.
+// ============================================================================
+let SuspiciousAuthentication =
+    BehaviorAnalytics
+    | where NativeTableName == "SigninLogs"
+    | where ActivityType == "LogOn"
+    | where ActionType == "Sign-in"
+    | where InvestigationPriority >= 5
+    | where isnotempty(UserPrincipalName)
+    | extend
+        AuthSid = toupper(tostring(UsersInsights.OnPremisesSID)),
+        AuthObjectId = tostring(UsersInsights.AccountObjectID),
+        AuthInsights = tostring(ActivityInsights)
+    | where isnotempty(AuthSid)
+    // Collapse bursts of enriched sign-ins from the same account/IP.
+    | extend AuthBucket = bin(TimeGenerated, 5m)
+    | summarize arg_max(TimeGenerated, *)
+        by AuthSid, SourceIPAddress, AuthBucket
+    | project
+        AuthTime = TimeGenerated,
+        AuthSid,
+        AuthUPN = UserPrincipalName,
+        AuthObjectId,
+        AuthPriority = InvestigationPriority,
+        AuthSourceIP = SourceIPAddress,
+        AuthSourceDevice = SourceDevice,
+        AuthInsights;
+// ============================================================================
+// STAGE 2 - Actual privilege change
+//
+// High-confidence privileged groups only.
+// 4728 = global security group
+// 4732 = domain-local security group
+// 4756 = universal security group
+// ============================================================================
+let PrivilegeChanges =
+    SecurityEvent
+    | where EventID in (4728, 4732, 4756)
+    | where
+        TargetSid endswith "-512"       // Domain Admins
+        or TargetSid endswith "-518"    // Schema Admins
+        or TargetSid endswith "-519"    // Enterprise Admins
+        or TargetSid == "S-1-5-32-544"  // BUILTIN\Administrators
+    | where isnotempty(SubjectUserSid)
+    | where isnotempty(MemberSid)
+    | extend
+        ActorSid = toupper(tostring(SubjectUserSid)),
+        BeneficiarySid = toupper(tostring(MemberSid)),
+        PrivilegedGroup = case(
+            TargetSid endswith "-512", "Domain Admins",
+            TargetSid endswith "-518", "Schema Admins",
+            TargetSid endswith "-519", "Enterprise Admins",
+            TargetSid == "S-1-5-32-544", "Administrators",
+            TargetUserName
+        )
+    | project
+        PrivilegeTime = TimeGenerated,
+        PrivilegeEventId = EventID,
+        ActorSid,
+        ActorName = SubjectUserName,
+        ActorDomain = SubjectDomainName,
+        BeneficiarySid,
+        BeneficiaryName = MemberName,
+        GroupName = PrivilegedGroup,
+        GroupSid = TargetSid,
+        ChangedOnDC = Computer;
+// ============================================================================
+// CORRELATION STAGE 1 -> STAGE 2
+//
+// Path 1:
+//   suspiciously authenticated identity performs the privilege change.
+//
+// This covers:
+//   A -> A -> A  self elevation
+//   A -> B -> B  compromised A elevates B, then B is used
+// ============================================================================
+let AuthenticatedActor =
+    SuspiciousAuthentication
+    | join kind=inner (
+        PrivilegeChanges
+    ) on $left.AuthSid == $right.ActorSid
+    | where PrivilegeTime >= AuthTime
+    | where PrivilegeTime <= AuthTime + AuthToPrivilegeWindow
+    | extend
+        LateralSid = BeneficiarySid,
+        ChainType = iff(
+            ActorSid == BeneficiarySid,
+            "A -> A -> A (authenticated actor self-elevation)",
+            "A -> B -> B (authenticated actor elevates another identity)"
+        );
+// ============================================================================
+// Path 2:
+//   suspiciously authenticated identity is the account RECEIVING privilege.
+//
+// Example:
+//   B signs in suspiciously -> admin/other compromised account elevates B
+//   -> B starts moving laterally.
+//
+// This is useful because group-management events contain both an actor
+// and a beneficiary, and the meaningful attack identity can be either.
+// ============================================================================
+let AuthenticatedBeneficiary =
+    SuspiciousAuthentication
+    | join kind=inner (
+        PrivilegeChanges
+    ) on $left.AuthSid == $right.BeneficiarySid
+    | where PrivilegeTime >= AuthTime
+    | where PrivilegeTime <= AuthTime + AuthToPrivilegeWindow
+    | where ActorSid != BeneficiarySid
+    | extend
+        LateralSid = BeneficiarySid,
+        ChainType = "B -> privilege granted by A -> B (authenticated beneficiary)";
+// Combine both valid identity relationships.
+let CorrelationCandidates =
+    union AuthenticatedActor, AuthenticatedBeneficiary;
+// ============================================================================
+// STAGE 3 - Remote access / lateral movement
+//
+// DeviceLogonEvents is used directly for now because UEBA enrichment for
+// DeviceLogonEvents is not yet present in BehaviorAnalytics in this tenant.
+//
+// Remote interactive = RDP.
+// Network logons are noisy, therefore they are accepted only when the
+// resulting session has local-admin privileges.
+// ============================================================================
+let LateralMovement =
+    DeviceLogonEvents
+    | where ActionType == "LogonSuccess"
+    | where LogonType in~ ("Remote interactive", "Network")
+    | where isnotempty(AccountSid)
+    | where isnotempty(RemoteIP) or isnotempty(RemoteDeviceName)
+    | where RemoteIP !in ("127.0.0.1", "::1")
+    | where
+        LogonType =~ "Remote interactive"
+        or IsLocalAdmin == true
+    | extend LateralSid = toupper(tostring(AccountSid))
+    | project
+        LateralTime = Timestamp,
+        LateralSid,
+        DeviceId,
+        DeviceName,
+        ReportId,
+        LateralAccountName = AccountName,
+        LateralAccountDomain = AccountDomain,
+        LogonType,
+        Protocol,
+        IsLocalAdmin,
+        RemoteIP,
+        RemoteDeviceName;
+// ============================================================================
+// COMPLETE CHAIN
+// ============================================================================
+CorrelationCandidates
+| join kind=inner (
+    LateralMovement
+) on LateralSid
+| where LateralTime >= PrivilegeTime
+| where LateralTime <= PrivilegeTime + PrivilegeToLateralWindow
+// Informational score.
+// All three stages are mandatory, so this score is primarily for triage.
+| extend ChainScore =
+      AuthPriority
+    + 4
+    + iff(LogonType =~ "Remote interactive", 3, 2)
+    + iff(IsLocalAdmin == true, 1, 0)
+// Prevent multiple remote logons from creating multiple rows for the same
+// identity / privilege change / destination device.
+| summarize arg_max(LateralTime, *)
+    by AuthSid, ActorSid, BeneficiarySid, GroupSid, DeviceId
+// Anchor the Custom Detection to the final MDE DeviceLogonEvents record.
+| project
+    Timestamp = LateralTime,
+    DeviceId,
+    DeviceName,
+    ReportId,
+    AccountSid = LateralSid,
+    AuthAccountSid = AuthSid,
+    AuthAccountObjectId = AuthObjectId,
+    AuthAccountUpn = AuthUPN,
+    ChainType,
+    ChainScore,
+    AuthTime,
+    AuthPriority,
+    AuthSourceIP,
+    AuthSourceDevice,
+    AuthInsights,
+    PrivilegeTime,
+    PrivilegeEventId,
+    ActorName,
+    ActorSid,
+    BeneficiaryName,
+    BeneficiarySid,
+    GroupName,
+    GroupSid,
+    ChangedOnDC,
+    LogonTime = LateralTime,
+    LogonType,
+    IsLocalAdmin,
+    RemoteIP,
+    RemoteDeviceName,
+    Protocol
