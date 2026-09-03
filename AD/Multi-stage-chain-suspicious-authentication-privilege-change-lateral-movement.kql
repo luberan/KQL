@@ -9,11 +9,6 @@ let MinAuthPriority = 5;
 // ============================================================================
 // STAGE 1 - Suspicious successful authentication
 //
-// BehaviorAnalytics provides UEBA event-level behavioral scoring.
-// In this environment:
-//   ~110k successful sign-ins / 30d
-//   only 52 successful sign-ins with InvestigationPriority >= 5
-//
 // Failed sign-ins are deliberately excluded - they are useful for password
 // spray / brute-force detections, but are not evidence that an attacker
 // obtained an authenticated session.
