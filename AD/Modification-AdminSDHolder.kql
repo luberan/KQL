@@ -1,0 +1,33 @@
+// This near-real-time (NRT) analytic rule detects modifications to the AdminSDHolder security descriptor by monitoring Security Event ID 5136 on domain controllers and filtering for changes to the nTSecurityDescriptor attribute of the AdminSDHolder object. The rule focuses specifically on permission changes, maps the account that performed the modification and the domain controller where it was recorded, and includes additional context to simplify incident triage and investigation. Entity mappings and custom details are configured to simplify incident triage and investigation.
+// Audit configuration change might be required for DCs without the v3 MDI sensor - Advanced Audit Policy -> DS Access -> Audit Directory Service Changes -> Success.
+SecurityEvent
+| where EventID == 5136
+| where EventData contains "<Data Name=\"ObjectDN\">CN=AdminSDHolder,CN=System,"
+| parse EventData with * 'ObjectDN">' ObjectDN "<" *
+| parse EventData with * 'AttributeLDAPDisplayName">' AttributeLDAPDisplayName "<" *
+| parse EventData with * 'AttributeValue">' AttributeValue "<" *
+| parse EventData with * 'OperationType">' OperationType "<" *
+| parse EventData with * 'OpCorrelationID">' OpCorrelationID "<" *
+| where AttributeLDAPDisplayName =~ "nTSecurityDescriptor"
+| where OperationType == "%%14674"
+| extend
+    HostName = tostring(split(Computer, ".")[0]),
+    HostDnsDomain = iif(
+        Computer contains ".",
+        substring(Computer, indexof(Computer, ".") + 1),
+        ""
+    )
+| project
+    TimeGenerated,
+    Computer,
+    SubjectAccount,
+    SubjectUserName,
+    SubjectDomainName,
+    SubjectUserSid,
+    SubjectLogonId,
+    ObjectDN,
+    AttributeLDAPDisplayName,
+    AttributeValue,
+    OpCorrelationID,
+    HostName,
+    HostDnsDomain
