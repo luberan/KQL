@@ -1,0 +1,52 @@
+// This is a near-real-time (NRT) analytic rule designed to detect potential Kerberoasting activity by identifying bursts of successful Kerberos service ticket requests using RC4 encryption (Event ID 4769, encryption type 0x17).
+// Instead of alerting on every RC4-encrypted ticket request, which would generate significant noise in environments where RC4 is still present, the rule aggregates requests per requesting account and source IP and triggers only when multiple distinct service accounts are targeted within a short period of time. Machine accounts, krbtgt, and self-requested tickets are excluded to further reduce false positives.
+let MinDistinctServices = 5;
+let MinRequests = 5;
+SecurityEvent
+| where EventID == 4769
+| parse EventData with * 'TargetUserName">' RequestingAccount "<" *
+| parse EventData with * 'TargetDomainName">' RequestingDomain "<" *
+| parse EventData with * 'ServiceName">' ServiceName "<" *
+| parse EventData with * 'TicketEncryptionType">' TicketEncryptionType "<" *
+| parse EventData with * 'TicketOptions">' TicketOptions "<" *
+| parse EventData with * 'Status">' Status "<" *
+| parse EventData with * 'IpAddress">' ClientIPAddress "<" *
+| where TicketEncryptionType =~ "0x17"
+| where Status =~ "0x0"
+| where isnotempty(RequestingAccount)
+| where isnotempty(ServiceName)
+| extend
+    RequestingAccountName = tostring(split(RequestingAccount, "@")[0]),
+    ClientIPAddress = replace_string(ClientIPAddress, "::ffff:", "")
+| where RequestingAccountName !endswith "$"
+| where ServiceName !endswith "$"
+| where ServiceName !~ "krbtgt"
+| where RequestingAccountName !~ ServiceName
+| summarize
+    StartTime = min(TimeGenerated),
+    EndTime = max(TimeGenerated),
+    RequestCount = count(),
+    DistinctServiceCount = dcount(ServiceName),
+    ServiceNames = make_set(ServiceName, 25),
+    TicketOptionsSet = make_set(TicketOptions, 10),
+    ReportingDCs = make_set(Computer, 5)
+    by RequestingAccount,
+       RequestingAccountName,
+       RequestingDomain,
+       ClientIPAddress
+| where RequestCount >= MinRequests
+    and DistinctServiceCount >= MinDistinctServices
+| extend TargetAccount = strcat(RequestingDomain, "\\", RequestingAccountName)
+| project
+    StartTime,
+    EndTime,
+    RequestingAccount,
+    RequestingAccountName,
+    RequestingDomain,
+    TargetAccount,
+    ClientIPAddress,
+    RequestCount,
+    DistinctServiceCount,
+    ServiceNames,
+    TicketOptionsSet,
+    ReportingDCs
