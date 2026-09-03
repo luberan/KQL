@@ -1,0 +1,33 @@
+// This near-real-time (NRT) analytic rule detects clearing of the Windows Security event log on domain controllers based on Security Event ID 1102. Domain controllers are identified using the DCSyncAllowedSources watchlist and the Role = DomainController attribute.
+let DomainControllers =
+    _GetWatchlist("DCSyncAllowedSources")
+    | where Role =~ "DomainController"
+    | extend DCShortName = tolower(tostring(split(tostring(DeviceName), ".")[0]))
+    | project DCShortName;
+SecurityEvent
+| where EventID == 1102
+| extend
+    HostName = tostring(split(Computer, ".")[0]),
+    HostNameLower = tolower(tostring(split(Computer, ".")[0])),
+    HostDnsDomain = iff(
+        Computer contains ".",
+        substring(Computer, indexof(Computer, ".") + 1),
+        ""
+    )
+| where HostNameLower in (DomainControllers)
+| extend
+    AccountName = SubjectUserName,
+    AccountNTDomain = SubjectDomainName,
+    AccountSid = SubjectUserSid,
+    ClearedBy = strcat(SubjectDomainName, "\\", SubjectUserName)
+| project
+    TimeGenerated,
+    Computer,
+    HostName,
+    HostDnsDomain,
+    ClearedBy,
+    AccountName,
+    AccountNTDomain,
+    AccountSid,
+    SubjectLogonId,
+    Activity
