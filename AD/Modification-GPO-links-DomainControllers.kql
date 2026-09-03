@@ -1,0 +1,72 @@
+// This near-real-time (NRT) analytic rule detects changes to Group Policy links on the Domain Controllers OU. It monitors modifications of the gPLink and gPOptions attributes, allowing us to detect when a GPO is linked or unlinked, when link order or options such as Enforced/Disabled are changed, or when Block Inheritance is modified.
+// Audit configuration change might be required for DCs without the v3 MDI sensor - Advanced Audit Policy -> DS Access -> Audit Directory Service Changes -> Success.
+let DomainControllersOU = "OU=Domain Controllers,DC=contoso,DC=com";
+SecurityEvent
+| where EventID == 5136
+| parse EventData with * 'ObjectDN">' ObjectDN "<" *
+| parse EventData with * 'ObjectClass">' ObjectClass "<" *
+| parse EventData with * 'AttributeLDAPDisplayName">' AttributeLDAPDisplayName "<" *
+| parse EventData with * 'AttributeValue">' AttributeValue "<" *
+| parse EventData with * 'OperationType">' OperationType "<" *
+| parse EventData with * 'OpCorrelationID">' OpCorrelationID "<" *
+| where ObjectDN =~ DomainControllersOU
+| where ObjectClass =~ "organizationalUnit"
+| where AttributeLDAPDisplayName in~ ("gPLink", "gPOptions")
+| summarize
+    TimeGenerated = min(TimeGenerated),
+    Computer = any(Computer),
+    SubjectAccount = any(SubjectAccount),
+    SubjectUserName = any(SubjectUserName),
+    SubjectDomainName = any(SubjectDomainName),
+    SubjectUserSid = any(SubjectUserSid),
+    SubjectLogonId = any(SubjectLogonId),
+    OldValue = anyif(AttributeValue, OperationType == "%%14675"),
+    NewValue = anyif(AttributeValue, OperationType == "%%14674")
+    by OpCorrelationID, ObjectDN, AttributeLDAPDisplayName
+| extend
+    OldGPOs = coalesce(
+        extract_all(@"(?i)CN=\{([0-9A-F-]{36})\},CN=Policies", OldValue),
+        dynamic([])
+    ),
+    NewGPOs = coalesce(
+        extract_all(@"(?i)CN=\{([0-9A-F-]{36})\},CN=Policies", NewValue),
+        dynamic([])
+    )
+| extend
+    AddedGPOs = set_difference(NewGPOs, OldGPOs),
+    RemovedGPOs = set_difference(OldGPOs, NewGPOs)
+| extend ChangeType = case(
+    AttributeLDAPDisplayName =~ "gPOptions",
+        "GPO inheritance changed",
+    array_length(AddedGPOs) > 0 and array_length(RemovedGPOs) > 0,
+        "GPO links changed",
+    array_length(AddedGPOs) > 0,
+        "GPO link added",
+    array_length(RemovedGPOs) > 0,
+        "GPO link removed",
+    "GPO link order/options changed"
+)
+| extend
+    HostName = tostring(split(Computer, ".")[0]),
+    HostDnsDomain = iff(
+        Computer contains ".",
+        substring(Computer, indexof(Computer, ".") + 1),
+        ""
+    )
+| project
+    TimeGenerated,
+    ChangeType,
+    ObjectDN,
+    AddedGPOs,
+    RemovedGPOs,
+    OldValue,
+    NewValue,
+    SubjectAccount,
+    SubjectUserName,
+    SubjectDomainName,
+    SubjectUserSid,
+    SubjectLogonId,
+    Computer,
+    OpCorrelationID,
+    HostName,
+    HostDnsDomain
