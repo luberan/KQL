@@ -1,4 +1,3 @@
-// This NRT analytic rule monitors service-related changes on domain controllers identified through the existing DCSyncAllowedSources watchlist (Role = DomainController). It detects new service installations using both System Event ID 7045 and Security Event ID 4697, as well as service startup type changes using Event ID 7040. Event ID 4697 was added because it provides better attribution, including the account that performed the service installation.
 let DomainControllers =
     _GetWatchlist("DCSyncAllowedSources")
     | where Role =~ "DomainController"
@@ -53,11 +52,6 @@ let SystemEvents =
                 extract('<Data Name="param4">([^<]*)</Data>', 1, EventData),
             ""
         ),
-        ServiceDisplayName = iff(
-            EventID == 7040,
-            extract('<Data Name="param1">([^<]*)</Data>', 1, EventData),
-            ""
-        ),
         ServiceFileName = iff(
             EventID == 7045,
             extract('<Data Name="ImagePath">([^<]*)</Data>', 1, EventData),
@@ -92,6 +86,7 @@ let SystemEvents =
         extract(@"^(.+?)_[0-9a-fA-F]+$", 1, ServiceName)
     | extend ServiceBaseName =
         iff(isempty(ServiceBaseName), ServiceName, ServiceBaseName)
+    // Exclude standard Windows per-user service instances.
     | where not(
         EventID == 7045
         and ServiceBaseName in~ (PerUserServices)
@@ -102,8 +97,7 @@ let SystemEvents =
         SubjectDomainName = "",
         SubjectUserSid = "",
         SubjectLogonId = "",
-        EventSource = "System"
-    | extend
+        EventSource = "System",
         HostName = tostring(split(Computer, ".")[0]),
         HostDnsDomain = extract(@"^[^.]+\.(.+)$", 1, Computer)
     | project
@@ -131,13 +125,13 @@ let SecurityEvents =
     | where EventID == 4697
     | extend DCName = tolower(tostring(split(Computer, ".")[0]))
     | join kind=inner DomainControllers on DCName
+    // Exclude standard Windows per-user service instances.
     | where tostring(ServiceType) !in~ ("0xd0", "0xe0")
     | extend
         EventAction = "Service installed",
         PreviousStartType = "",
         NewStartType = "",
-        EventSource = "Security"
-    | extend
+        EventSource = "Security",
         HostName = tostring(split(Computer, ".")[0]),
         HostDnsDomain = extract(@"^[^.]+\.(.+)$", 1, Computer)
     | project
@@ -161,4 +155,47 @@ let SecurityEvents =
         HostName,
         HostDnsDomain;
 union SystemEvents, SecurityEvents
+// Normalize path for precise benign-pattern matching.
+| extend NormalizedServicePath =
+    tolower(replace_string(tostring(ServiceFileName), '"', ''))
+// Azure Update Manager WindowsPatchExtension.
+| extend IsAzureUpdateManagerService =
+    EventID in (4697, 7045)
+    and ServiceName =~ "AutoAssessPatchService"
+    and NormalizedServicePath startswith
+        @"c:\packages\plugins\microsoft.cplat.core.windowspatchextension\"
+    and NormalizedServicePath endswith
+        @"\bin\autoassesspatchservice.exe"
+    and ServiceAccount in~ ("LocalSystem", "Local System")
+    and (
+        EventID == 7045
+        or SubjectUserSid == "S-1-5-18"
+    )
+// Known Microsoft Defender KslD driver registration.
+// Suppress only the expected driver name, path, account and startup configuration.
+| extend IsKnownDefenderKslD =
+    EventID in (4697, 7045)
+    and ServiceName =~ "KslD"
+    and NormalizedServicePath endswith @"system32\drivers\wd\ksld.sys"
+    and ServiceAccount in~ ("LocalSystem", "Local System")
+    and (
+        // Security Event 4697 represents Demand Start as 3.
+        (
+            EventID == 4697
+            and ServiceStartType == "3"
+            and SubjectUserSid == "S-1-5-18"
+        )
+        or
+        // System Event 7045 contains rendered startup type text.
+        (
+            EventID == 7045
+            and ServiceStartType =~ "demand start"
+        )
+    )
+| where IsAzureUpdateManagerService == false
+    and IsKnownDefenderKslD == false
+| project-away
+    NormalizedServicePath,
+    IsAzureUpdateManagerService,
+    IsKnownDefenderKslD
 | order by TimeGenerated desc
